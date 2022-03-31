@@ -10,12 +10,37 @@ import zlib
 argparser = argparse.ArgumentParser(description="The stupid content tracker")
 argsubparsers = argparser.add_subparsers(title="Commands", dest="command")
 argsubparsers.required = True
+
+# Git Init Subparser
 argsp = argsubparsers.add_parser("init", help="Initialize a new,empty repository.")
 argsp.add_argument("path", metavar="directory", nargs="?", default=".", help="Where to create the repository.")
 
+# Git cat-file subparser
+argsp = argsubparsers.add_parser("cat-file",
+                                 help="Provide content of repository objects")
 
-def cmd_init(args):
-    repo_create(args.path)
+argsp.add_argument("type",
+                   metavar="type",
+                   choices=["blob", "commit", "tag", "tree"],
+                   help="Specify the type")
+
+argsp.add_argument("object",
+                   metavar="object",
+                   help="The object to display")
+
+# Git hash-object parser
+argsp = argsubparsers.add_parser("hash-object", help="Compute object ID and optionally creates a blob from a file")
+
+argsp.add_argument("-t", metavar="type", dest="type", choices=["blob", "commit", "tag", "tree"], default="blob",
+                   help="Specify the type")
+argsp.add_argument("-w", dest="write", action="store_true", help="Actually write the object int the database")
+
+argsp.add_argument("path", help="Read object from <file>")
+
+
+def object_find(repo, name, fmt=None, follow=True):
+    return name
+
 
 def repo_path(repo, *path):
     """Compute path under repo's gitdir."""
@@ -52,6 +77,7 @@ def repo_default_config():
     ret.set("core", "repositoryformatversion", "0")
     ret.set("core", "filemode", "false")
     ret.set("core", "bare", "false")
+
     return ret
 
 
@@ -83,6 +109,112 @@ def repo_create(path):
     return repo
 
 
+
+
+
+
+def repo_find(path=".", required=True):
+    path = os.path.realpath(path)
+
+    if os.path.isdir(os.path.join(path, ".git")):
+        return GitRepository(path)
+
+    # If we haven't returned, recurse in parent, if w
+    parent = os.path.realpath(os.path.join(path, ".."))
+
+    if parent == path:
+        # Bottom case
+        # os.path.join("/","..") == "/"
+        # if parent == path, then path is root.
+        if required:
+            raise Exception("No git repository.")
+        else:
+            return None
+    # Recursive case
+    return repo_find(parent, required)
+
+
+class GitObject(object):
+    repo = None
+
+    def __init__(self, repo, data=None):
+        self.repo = repo
+
+        if data:
+            self.deserialize(data)
+
+    def serialize(self, data):
+        """ This function Must be implemented by subclass.
+        It must read the object's contents from self. Data, a byte string, and do
+        whatever it takes to convert it into a meaningful representation. What exactly that means depend on each subclass."""
+        raise Exception("Unimplemented")
+
+    def deserialize(self):
+        raise Exception("Unimplemented")
+
+
+def object_read(repo, sha):
+    """Read object object_id from Git Repository repo. Return a Git Object whose exact type depends on the object"""
+    path = repo_file(repo, "objects", sha[0:2], sha[2:])
+    with open(path, "rb") as f:
+        raw = zlib.decompress(f.read())
+
+        # Read Object type
+        x = raw.find(b' ')
+        fmt = raw[0:x]
+
+        # Read and validate object size
+        y = raw.find(b'\x00', x)
+        size = int(raw[x:y].decode("ascii"))
+        if size != len(raw) - y - 1:
+            raise Exception("Malformed object {0}: bad length".format(sha))
+
+        # Pick Constructor
+        if fmt == b'commit':
+            c = GitCommit
+        elif fmt == b'tree':
+            c = GitTree
+        elif fmt == b'tag':
+            c = GitTag
+        elif fmt == b'blog':
+            c = GitBlob
+        else:
+            raise Exception("Unknown type {0} for object {1}".format(fmt.decode("ascii"), sha))
+
+        # Call Constructor and return object
+        return c(repo, raw[y + 1:])
+
+
+class GitBlob(GitObject):
+    fmt = b'blob'
+
+    def __init__(self, repo, data=None):
+        super().__init__(repo, data)
+        self.blobdata = data
+
+    def serialize(self):
+        return self.blobdata
+
+    def deserialize(self, data):
+        self.blobdata = data
+
+
+def object_write(obj, actually_write=True):
+    # Serialize object data
+    data = obj.serialize()
+    # Add Header
+    result = obj.fmt + b' ' + str(len(data)).encode() + b'\x00' + data
+    # Compute hash
+    sha = hashlib.sha1(result).hexdigest()
+    if actually_write:
+        # Compute path
+        path = repo_file(obj.repo, "objects", sha[0:2], sha[2:], mkdir=actually_write)
+        with open(path, 'wb') as f:
+            # Compress and write
+            f.write(zlib.compress(result))
+    return sha
+
+
 class GitRepository(object):
     """A Git Repository"""
     worktree = None
@@ -111,10 +243,53 @@ class GitRepository(object):
                 raise Exception("Unsupported repositoyformatversion %s" % vers)
 
 
+def object_hash(fd, fmt, repo=None):
+    data = fd.read()
+    # Choose constructor depending on
+    # object type found in header.
+    if fmt == b'commit':
+        obj = GitCommit(repo, data)
+    elif fmt == b'tree':
+        obj = GitTree(repo, data)
+    elif fmt == b'tag':
+        obj = GitTag(repo, data)
+    elif fmt == b'blob':
+        obj = GitBlob(repo, data)
+    else:
+        raise Exception("Unknown type %s!" % fmt)
+    return object_write(obj, repo)
+
+
+def cmd_init(args):
+    repo_create(args.path)
+
+
+def cmd_cat_file(args):
+    repo = repo_find()
+    cat_file(repo, args.object, fmt=args.type.encode())
+
+
+def cat_file(repo, obj, fmt=None):
+    obj = object_read(repo, object_find(repo, obj, fmt=fmt))
+    sys.stdout.buffer.write(obj.serialize())
+
+
+def cmd_hash_object(args):
+    if args.write:
+        repo = GitRepository(".")
+    else:
+        repo = None
+
+    with open(args.path, "rb") as fd:
+        sha = object_hash(fd, args.type.encode(), repo)
+        print(sha)
+
+
 def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
     args = argparser.parse_args(argv)
     if args.command == "init":
         cmd_init(args)
-
+    elif args.command == "cat-file":
+        cmd_cat_file(args)

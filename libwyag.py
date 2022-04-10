@@ -4,7 +4,6 @@ import configparser
 import hashlib
 import os
 import sys
-import re
 import zlib
 
 argparser = argparse.ArgumentParser(description="The stupid content tracker")
@@ -27,6 +26,31 @@ argsp.add_argument("type",
 argsp.add_argument("object",
                    metavar="object",
                    help="The object to display")
+
+argsp = argsubparsers.add_parser(
+    "hash-object",
+    help="Compute object ID and optionally creates a blob from a file")
+
+argsp.add_argument("-t",
+                   metavar="type",
+                   dest="type",
+                   choices=["blob", "commit", "tag", "tree"],
+                   default="blob",
+                   help="Specify the type")
+
+argsp.add_argument("-w",
+                   dest="write",
+                   action="store_true",
+                   help="Actually write the object into the database")
+
+argsp.add_argument("path",
+                   help="Read object from <file>")
+
+argsp = argsubparsers.add_parser("log", help="Display history of a given commit.")
+argsp.add_argument("commit",
+                   default="HEAD",
+                   nargs="?",
+                   help="Commit to start at.")
 
 # Git hash-object parser
 argsp = argsubparsers.add_parser("hash-object", help="Compute object ID and optionally creates a blob from a file")
@@ -109,10 +133,6 @@ def repo_create(path):
     return repo
 
 
-
-
-
-
 def repo_find(path=".", required=True):
     path = os.path.realpath(path)
 
@@ -141,15 +161,15 @@ class GitObject(object):
         self.repo = repo
 
         if data:
-            self.deserialize(data)
+            self.deserialize()
 
-    def serialize(self, data):
+    def serialize(self):
         """ This function Must be implemented by subclass.
         It must read the object's contents from self. Data, a byte string, and do
         whatever it takes to convert it into a meaningful representation. What exactly that means depend on each subclass."""
         raise Exception("Unimplemented")
 
-    def deserialize(self):
+    def deserialize(self, data):
         raise Exception("Unimplemented")
 
 
@@ -199,6 +219,20 @@ class GitBlob(GitObject):
         self.blobdata = data
 
 
+class GitCommit(GitObject):
+    fmt = b'commit'
+
+    def __init__(self, repo, data=None):
+        super().__init__(repo, data)
+        self.kvlm = None
+
+    def deserialize(self, data):
+        self.kvlm = kvlm_parse(data)
+
+    def serialize(self):
+        return kvlm_serialize(self.kvlm)
+
+
 def object_write(obj, actually_write=True):
     # Serialize object data
     data = obj.serialize()
@@ -240,7 +274,100 @@ class GitRepository(object):
         if not force:
             vers = int(self.conf.get("core", "repositoryformatversion"))
             if vers != 0:
-                raise Exception("Unsupported repositoyformatversion %s" % vers)
+                raise Exception("Unsupported repositoryformatversion %s" % vers)
+
+
+# Structure of a commit in git
+''' tree 29ff16c9c14e2652b22f8b78bb08a5a07930c147
+parent 206941306e8a8af65b66eaaaea388a7ae24d49a0
+author Thibault Polge <thibault@thb.lt> 1527025023 +0200
+committer Thibault Polge <thibault@thb.lt> 1527025044 +0200
+gpgsig -----BEGIN PGP SIGNATURE-----
+
+ iQIzBAABCAAdFiEExwXquOM8bWb4Q2zVGxM2FxoLkGQFAlsEjZQACgkQGxM2FxoL
+ kGQdcBAAqPP+ln4nGDd2gETXjvOpOxLzIMEw4A9gU6CzWzm+oB8mEIKyaH0UFIPh
+ rNUZ1j7/ZGFNeBDtT55LPdPIQw4KKlcf6kC8MPWP3qSu3xHqx12C5zyai2duFZUU
+ wqOt9iCFCscFQYqKs3xsHI+ncQb+PGjVZA8+jPw7nrPIkeSXQV2aZb1E68wa2YIL
+ 3eYgTUKz34cB6tAq9YwHnZpyPx8UJCZGkshpJmgtZ3mCbtQaO17LoihnqPn4UOMr
+ V75R/7FjSuPLS8NaZF4wfi52btXMSxO/u7GuoJkzJscP3p4qtwe6Rl9dc1XC8P7k
+ NIbGZ5Yg5cEPcfmhgXFOhQZkD0yxcJqBUcoFpnp2vu5XJl2E5I/quIyVxUXi6O6c
+ /obspcvace4wy8uO0bdVhc4nJ+Rla4InVSJaUaBeiHTW8kReSFYyMmDCzLjGIu1q
+ doU61OM3Zv1ptsLu3gUE6GU27iWYj2RWN3e3HE4Sbd89IFwLXNdSuM0ifDLZk7AQ
+ WBhRhipCCgZhkj9g2NEk7jRVslti1NdN5zoQLaJNqSwO1MtxTmJ15Ksk3QP6kfLB
+ Q52UWybBzpaP9HEd4XnR+HuQ4k2K0ns2KgNImsNvIyFwbpMUyUWLMPimaV1DWUXo
+ 5SBjDB/V/W2JBFR+XKHFJeFwYhj7DD/ocsGr4ZMx/lgc8rjIBkI=
+ =lgTX
+ -----END PGP SIGNATURE-----
+
+Create first draft'''
+
+
+def kvlm_parse(raw, start=0, dct=None):
+    if not dict:
+        dct = collections.OrderedDict()
+
+    # We search for the next space and next newline.
+    spc = raw.find(b' ', start)
+    nl = raw.find(b'\n', start)
+
+    # If space appears before newline, we have a keyword.
+
+    # Base Case
+    # ---------------------------------------
+    # If newline appears first ( or there's no space at all, in which case
+    # find returns -1, we assume a blank line. A blank line
+    # means the remainder of the data is the message.
+    if (spc < 0) or (nl < spc):
+        assert (nl == start)
+        dct[b''] = raw[start + 1:]
+        return dct
+
+    # Recursive case
+    # ----------------------------------------
+    # we read a key-value pair and recurse for the next.
+    key = raw[start:spc]
+
+    # Find the end of the value. Continuation line starts with a space.
+    # so we loop until we find a "\n" not followed by a space.
+    end = start
+    while True:
+        end = raw.find(b'\n', end + 1)
+        if raw[end + 1] != ord(' '): break
+
+    # Grab the value
+    # Also, drop the leading space on continuation lines.
+    value = raw[spc + 1:end].replace(b'\n ', b'\n')
+
+    # Don't overwrite existing data contents
+    if key in dct:
+        if type(dct[key]) == list:
+            dct[key].append(value)
+        else:
+            dct[key] = [dct[key], value]
+    else:
+        dct[key] = value
+
+    return kvlm_parse(raw, start=end + 1, dct=dct)
+
+
+def kvlm_serialize(kvlm):
+    ret = b''
+
+    # Output fields
+    for k in kvlm.keys():
+        # Skip the message itself
+        if k == b'': continue
+        val = kvlm[k]
+        # Normalize to a list
+        if type(val) != list:
+            val = [val]
+
+        for v in val:
+            ret += k + b' ' + (v.replace(b'\n', b'\n ')) + b'\n'
+
+    # Append message
+    ret += b'\n' + kvlm[b'']
+    return ret
 
 
 def object_hash(fd, fmt, repo=None):
@@ -285,6 +412,37 @@ def cmd_hash_object(args):
         print(sha)
 
 
+def log_graphviz(repo, sha, seen):
+    if sha in seen:
+        return
+    seen.add(sha)
+
+    commit = object_read(repo, sha)
+    assert (commit.fmt == b'commit')
+
+    if not b'parent' in commit.kvlm.keys():
+        # Base case: the initial commit.
+        return
+
+    parents = commit.kvlm[b'parent']
+
+    if type(parents) != list:
+        parents = [parents]
+
+    for p in parents:
+        p = p.decode("ascii")
+        print("c_{0} -> c_{1};".format(sha, p))
+        log_graphviz(repo, p, seen)
+
+
+def cmd_log(args):
+    repo = repo_find()
+
+    print("digraph wyaglog{")
+    log_graphviz(repo, object_find(repo, args.commit), set())
+    print("}")
+
+
 def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
@@ -293,3 +451,7 @@ def main(argv=None):
         cmd_init(args)
     elif args.command == "cat-file":
         cmd_cat_file(args)
+    elif args.command == "hash-object":
+        cmd_hash_object(args)
+    elif args.command == "log":
+        cmd_log(args)
